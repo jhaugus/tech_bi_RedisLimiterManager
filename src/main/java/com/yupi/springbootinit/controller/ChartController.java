@@ -1,6 +1,7 @@
 package com.yupi.springbootinit.controller;
 
 
+import cn.hutool.core.io.FileUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 
@@ -16,10 +17,13 @@ import com.yupi.springbootinit.constant.UserConstant;
 import com.yupi.springbootinit.exception.BusinessException;
 import com.yupi.springbootinit.exception.ThrowUtils;
 
+import com.yupi.springbootinit.manager.AiManager;
+import com.yupi.springbootinit.manager.RedisLimiterManager;
 import com.yupi.springbootinit.model.dto.chart.*;
 import com.yupi.springbootinit.model.entity.Chart;
 import com.yupi.springbootinit.model.entity.User;
 
+import com.yupi.springbootinit.model.vo.BiResponse;
 import com.yupi.springbootinit.service.ChartService;
 import com.yupi.springbootinit.service.UserService;
 
@@ -28,12 +32,16 @@ import com.yupi.springbootinit.utils.SqlUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.joda.time.LocalTime;
 import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
 
 
 /**
@@ -53,11 +61,11 @@ public class ChartController {
     @Resource
     private UserService userService;
 
-//    @Resource
-//    private AiManager aiManager;
+    @Resource
+    private AiManager aiManager;
 
-//    @Resource
-//    private RedisLimiterManager redisLimiterManager;
+    @Resource
+    private RedisLimiterManager redisLimiterManager;
 
 //    @Resource
 //    private ThreadPoolExecutor threadPoolExecutor;
@@ -162,6 +170,8 @@ public class ChartController {
      * @param request
      * @return
      */
+
+    // todo 分页功能
     @PostMapping("/list/page")
     public BaseResponse<Page<Chart>> listChartByPage(@RequestBody ChartQueryRequest chartQueryRequest,
             HttpServletRequest request) {
@@ -275,29 +285,85 @@ public class ChartController {
      */
     // todo genChartByAi开发
     @PostMapping("/gen")
-    public BaseResponse<String> genChartByAi(@RequestPart("file") MultipartFile multipartFile,
+    public BaseResponse<BiResponse> genChartByAi(@RequestPart("file") MultipartFile multipartFile,
                                                  GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+
+        long biModelId = CommonConstant.BI_MODEL_ID;  // todo 如果不对，需要修改
 
         // todo 第一阶段 实现文件上传后的输出
         String name = genChartByAiRequest.getName();
         String goal = genChartByAiRequest.getGoal();
         String chartType = genChartByAiRequest.getChartType();
+
+        // 校验
         ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
         ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+        // todo 第四阶段 安全性校验
+        long size = multipartFile.getSize();
+        String originalFilename = multipartFile.getOriginalFilename();
+        final long ONE_MB = 1*1024 * 1024L;
+        ThrowUtils.throwIf(size > ONE_MB, ErrorCode.PARAMS_ERROR, "文件超过 1M");
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> validFileSuffixList = Arrays.asList("xlsx", "xls");
+        ThrowUtils.throwIf(!validFileSuffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件后缀非法");
+
+        User loginUser = userService.getLoginUser(request);
+        // todo 第五阶段 限流
+        // 每个用户一个限流器
+        redisLimiterManager.doRateLimit("genChartByAi_" + String.valueOf(loginUser.getId()));
+
         // todo excelTOCsv返回的是压缩后的数据
 //        return ResultUtils.success(ExcelUtils.excelToCsv(multipartFile));
 
-
         // todo 第二阶段  加工喂给AI的数据
+        // 因为使用yucongmingAi所以可以不用谢prompt
         StringBuilder userInput = new StringBuilder();
-        userInput.append("你是一个数据分析师，我回给你数据，请你告诉我分析结论").append("\n");
-        userInput.append("分析目标是").append(goal).append("\n");
-        String result = ExcelUtils.excelToCsv(multipartFile);
-        userInput.append("数据如下：\n").append(result);
-        return ResultUtils.success(userInput.toString());
+//        userInput.append("你是一个数据分析师，我回给你数据，请你告诉我分析结论").append("\n");
+//        userInput.append("分析目标是").append(goal).append("\n");
+//        String result = ExcelUtils.excelToCsv(multipartFile);
+//        userInput.append("数据如下：\n").append(result);
+//        return ResultUtils.success(userInput.toString());
+        userInput.append("分析需求：").append("\n");
 
-        
+        String userGoal = goal;
+        if(StringUtils.isNotBlank(chartType)){
+            userGoal += ", 请使用" + chartType;
+        }
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据：").append("\n");
+        // 压缩后的数据
+        String dataToCsv = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append(dataToCsv).append("\n");
 
+        String result = aiManager.doChat(biModelId, userInput.toString());
+        String[] splits = result.split("【【【【【");
+        if(splits.length < 3){
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "AI 生成错误");
+        }
+        String genChart = splits[1].trim();
+        String genResult = splits[2].trim();
+        // 插入到数据库
+        Chart chart = new Chart();
+        chart.setName(name);
+        chart.setGoal(userGoal);
+        chart.setChartData(dataToCsv);
+        chart.setChartType(chartType);
+        chart.setGenChart(genChart);
+        chart.setGenResult(genResult);
+        Long currentUserId = userService.getLoginUser(request).getId();
+        chart.setUserId(currentUserId);
+        chart.setCreateTime(new Date());
+        chart.setUpdateTime(new Date());
+        boolean saveResult = chartService.save(chart);
+        ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图标保存失败");
+
+
+        BiResponse biResponse = new BiResponse();
+        biResponse.setGenChart(genChart);
+        biResponse.setGenResult(genResult);
+        biResponse.setCharId(chart.getId());
+
+        return ResultUtils.success(biResponse);
     }
 
 }
