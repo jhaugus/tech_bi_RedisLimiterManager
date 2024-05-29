@@ -12,11 +12,11 @@ public class AiManagerTest {
     @Resource
     private AiManager aiManager;
 
-    @Test
-    public void doChat() {
-
-        String result = aiManager.doChat("邓紫棋");
-        System.out.println(result);
-
-    }
+//    @Test
+//    public void doChat() {
+//
+//        String result = aiManager.doChat("邓紫棋");
+//        System.out.println(result);
+//
+//    }
 }

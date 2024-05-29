@@ -52,6 +52,12 @@ server:
     session:
       cookie:
         max-age: 2592000
+  rabbitmq:
+    host: localhost
+    port: 5672
+    password: guest
+    username: guest
+
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: false
